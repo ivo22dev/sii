@@ -106,6 +106,27 @@ export {
   TIPOS_DTE,
   MAX_ITEMS,
 } from './tasks/dte.js';
+export {
+  decodeDteXmlBytes,
+  parseDteRespaldoXml,
+  parseDteRespaldoXmlFiles,
+  auditDteXmlTotal,
+  uniqueContrapartes,
+  respaldoOrigenToSide,
+} from './portal/dte-xml-parse.js';
+export type {
+  DteXmlSide,
+  DteXmlParseResult,
+  DteXmlDocumento,
+  DteXmlLinea,
+  DteXmlContraparte,
+  DteXmlImpuestoAdicional,
+  DteXmlImpuestoRetenido,
+  DteXmlAjusteGlobal,
+  DteXmlPago,
+  DteXmlReferencia,
+  DteXmlTotalAudit,
+} from './portal/dte-xml-parse.js';
 export type {
   DteAutorizados,
   DteAutorizado,

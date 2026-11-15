@@ -24,6 +24,7 @@ Every decision behind a release is recorded as an ADR under
      while an entry remains. -->
 
 - **Added:** `sii dte xml` (MCP `dte_xml`, core `dteXml`) downloads signed DTE XML sets (`<SetDTE>` / `<EnvioDTE>`) from Respaldo MIPYME (`env` issued or `rcp` received), bisecting automatically by date and `TPO_DOC` above SII's 20-document cap and writing undecoded ISO-8859-1 bytes through `FileSink` (#169).
+- **Added:** `parseDteRespaldoXml`, `parseDteRespaldoXmlFiles`, `decodeDteXmlBytes`, `auditDteXmlTotal`, `uniqueContrapartes`, and `respaldoOrigenToSide` in `@albertomarturelo/sii-core` parse SII DTE XML sets (`<SetDTE>`, `<EnvioDTE>`, `<EnvioBOLETA>`, `<DTE>`) into a curated projection without `raw` (ADR-037), plus curated RCV detail fields for additional taxes and withheld IVA (`montoImpuestoAdicional`, `ivaRetenidoTotal`, `ivaRetenidoParcial`, `ivaNoRetenido`, `montoNoFacturable`, `tipoTransaccion`).
 
 ## 0.20.0 — 2026-11-13 — La reparación
 

@@ -39,6 +39,7 @@
     "prepack": "rm -rf dist tsconfig.tsbuildinfo && tsc -b"
   },
   "dependencies": {
+    "fast-xml-parser": "^5.12.1",
     "zod": "^4.4.3"
   },
   "peerDependencies": {

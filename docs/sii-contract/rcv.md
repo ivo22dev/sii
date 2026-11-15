@@ -98,6 +98,9 @@ envelope level (the UI sums rows client-side).
 | fecha emisión | `detFchDoc` | `DD/MM/YYYY` → ISO `YYYY-MM-DD` |
 | fecha recepción | `detFecRecepcion` | `DD/MM/YYYY HH:MM:SS` → ISO |
 | montos exento/neto/IVA/total | `detMntExe` / `detMntNeto` / `detMntIVA` / `detMntTotal` | |
+| impuesto adicional agregado | `totalDtoiMontoImp` | Campo agregado distinto de retenciones de IVA; permanece nullable si SII no lo entrega. |
+| retenciones de IVA y no facturable | `detIVARetTotal` / `detIVARetParcial` / `detIVANoRetenido` / `detMntNoFact` | Separados de impuestos adicionales. |
+| tipo de transacción | `descTipoTransaccion` (`detTipoTransaccion`, `tipoTransaccion`) | |
 | evento receptor (+ leyenda) | `detEventoReceptor` / `detEventoReceptorLeyenda` | |
 
 Tax-special fields (activo fijo, IVA uso común, Ley 18211, tabaco, vehículos, …) are
@@ -121,7 +124,13 @@ Confirmed live: a persona's self VENTA and a represented empresa's COMPRA both r
 
 - `RcvResumen { rut, periodo, side, rows: RcvResumenRow[], totalDocumentos }`.
 - `RcvDetalle { rut, periodo, side, codigoTipoDoc, docs: RcvDetalleDoc[] }`, each doc
-  curated (~11 fields) + `raw`.
+  curated + `raw`. Curated fields expose `detIVARetTotal`,
+  `detIVARetParcial`, `detIVANoRetenido`, `detMntNoFact`,
+  `totalDtoiMontoImp`, and `descTipoTransaccion` under neutral names. Raw remains available for every
+  other RCV field.
+- Retained IVA is kept distinct from additional tax. For a DTE 46, the reported
+  total may be `neto + IVA - IVA retenido`; do not recompute or overwrite the
+  SII `montoTotal` with `neto + IVA`.
 
 ## Live findings (2026-06-28, persona-natural session, read-only)
 
