@@ -20,10 +20,12 @@ import {
   dteEmpresas,
   dtePdf,
   dtePreviewPdf,
+  dteXml,
   formatMoney as money,
   formatRut as fmtRut,
   type DteBorradorArgs,
   type DteItem,
+  type DteXmlOrigen,
   type EstadoEmitido,
   type DteSelectAviso,
   type FormaPago,
@@ -443,6 +445,76 @@ export function registerDte(program: Command, runtime: Runtime): void {
             `  neto=${money(res.totales.neto)}  IVA=${money(res.totales.iva)}  ` +
               `total=${money(res.totales.total)}`,
           );
+        });
+      },
+    );
+
+  dte
+    .command('xml')
+    .description(
+      'Empresa-keyed (--empresa validado contra el Portal MIPYME). Descarga los XML firmados ' +
+        '(<SetDTE> / <EnvioDTE>) de documentos EMITIDOS (ENV) o RECIBIDOS (RCP) desde Respaldo ' +
+        'MIPYME. Bisecciona automáticamente por fecha y tipo de DTE si el rango supera el tope ' +
+        'de 20 documentos del portal.',
+    )
+    .requiredOption('--empresa <rut>', 'RUT de la empresa en el Portal MIPYME.')
+    .requiredOption('--desde <YYYY-MM-DD>', 'Fecha inicial (YYYY-MM-DD).')
+    .requiredOption('--hasta <YYYY-MM-DD>', 'Fecha final (YYYY-MM-DD).')
+    .option('--origen <origen>', 'ENV (emitidos, por defecto) | RCP (recibidos).', 'ENV')
+    .option(
+      '--tipo-doc <n>',
+      'Filtra por tipo de DTE (33, 34, 46, 52, 56, 61, 110, 111, 112).',
+      parseTipo,
+    )
+    .option('--folio <n>', 'Filtra por folio inicial.', parsePositiveInt('--folio'))
+    .option(
+      '--folio-hasta <n>',
+      'Filtra por folio final (requiere --folio).',
+      parsePositiveInt('--folio-hasta'),
+    )
+    .option(
+      '--out <dir>',
+      'Carpeta destino (por defecto, documentos/dte bajo $SII_HOME, o ~/.sii sin ella).',
+      join(documentosDir(), 'dte'),
+    )
+    .action(
+      async (opts: {
+        empresa: string;
+        origen: string;
+        desde: string;
+        hasta: string;
+        tipoDoc?: number;
+        folio?: number;
+        folioHasta?: number;
+        out: string;
+      }) => {
+        const origenUpper = opts.origen.toUpperCase();
+        if (origenUpper !== 'ENV' && origenUpper !== 'RCP') {
+          throw new Error(`--origen inválido: "${opts.origen}" (ENV | RCP).`);
+        }
+        const res = await dteXml(runtime, {
+          empresa: opts.empresa,
+          origen: origenUpper as DteXmlOrigen,
+          desde: opts.desde,
+          hasta: opts.hasta,
+          directorio: opts.out,
+          ...(opts.tipoDoc !== undefined ? { tipoDoc: opts.tipoDoc } : {}),
+          ...(opts.folio !== undefined ? { folio: opts.folio } : {}),
+          ...(opts.folioHasta !== undefined ? { folioHasta: opts.folioHasta } : {}),
+        });
+        emit(res, () => {
+          out(
+            `Respaldo XML (${res.origen === 'ENV' ? 'emitidos' : 'recibidos'}) — ` +
+              `${res.empresa.rut} ${res.empresa.nombre}`,
+          );
+          if (res.archivos.length === 0) {
+            out('Sin documentos para ese filtro.');
+            return;
+          }
+          for (const a of res.archivos) {
+            out(`  ${a.path} (${a.documentos} doc(s), ${a.bytes} bytes)`);
+          }
+          out(`${res.total} documento(s) en ${res.archivos.length} archivo(s).`);
         });
       },
     );

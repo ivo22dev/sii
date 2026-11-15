@@ -19,13 +19,15 @@ import { recordAudit } from '../audit/index.js';
 import { Rut } from '../rut/index.js';
 import { fetchDteAutorizados } from '../portal/dte-public.js';
 import type { DteAutorizados } from '../portal/dte-public.js';
-import { DteError, SiiError, ValidationError } from '../errors/index.js';
+import { AbortedError, DteError, SiiError, ValidationError } from '../errors/index.js';
+import { checkAborted } from '../errors/abort.js';
 import { DEFAULT_SETTINGS } from '../config/index.js';
 import {
   FORMA_PAGO,
   MAX_ITEMS,
   TIPOS_DTE,
   fetchBorradores,
+  fetchDteXml,
   fetchEmitidaPdf,
   fetchEmitidas,
   fetchEmpresas,
@@ -46,6 +48,7 @@ import type {
   DteEmpresa,
   DteItem,
   DteTotales,
+  DteXmlOrigen,
   FormaPago,
   TipoDte,
 } from '../portal/dte-mipyme.js';
@@ -60,10 +63,11 @@ export type {
   DteEmpresa,
   DteItem,
   DteTotales,
+  DteXmlOrigen,
   FormaPago,
   TipoDte,
 } from '../portal/dte-mipyme.js';
-export { TIPOS_DTE, MAX_ITEMS } from '../portal/dte-mipyme.js';
+export { DTE_XML_MAX_DOCS, TIPOS_DTE, MAX_ITEMS } from '../portal/dte-mipyme.js';
 export type { DteAutorizados, DteAutorizado } from '../portal/dte-public.js';
 
 /** How far `dtePdf` walks the emitted listing when it is addressed by SII's internal
@@ -640,6 +644,168 @@ export async function dtePdf(
     return res;
   } catch (e) {
     audit(runtime, 'dte_pdf', 'failed', { rut: empresa.canonical, folio: args.folio ?? null });
+    throw e;
+  }
+}
+
+// --- Respaldo XML (`lista_documentos.cgi` + `download.cgi`, #169) -----------------------
+
+/** One downloaded XML bundle written through `FileSink` — a DESCRIPTOR, never the bytes
+ *  (ADR-022 / ADR-006: the XML carries both parties' identity, line items and signature). */
+export interface DteXmlArchivo {
+  readonly path: string;
+  readonly archivo: string;
+  readonly bytes: number;
+  readonly contentType: string;
+  readonly desde: string;
+  readonly hasta: string;
+  readonly documentos: number;
+  readonly tipoDoc?: number;
+}
+
+export interface DteXmlResult {
+  readonly empresa: DteEmpresa;
+  readonly origen: DteXmlOrigen;
+  readonly desde: string;
+  readonly hasta: string;
+  readonly total: number;
+  readonly archivos: readonly DteXmlArchivo[];
+}
+
+export interface DteXmlArgs {
+  readonly empresa: string;
+  readonly origen: DteXmlOrigen;
+  readonly desde: string;
+  readonly hasta: string;
+  readonly tipoDoc?: number;
+  readonly folio?: number;
+  readonly folioHasta?: number;
+  readonly tipoDte?: number;
+  readonly directorio: string;
+  readonly signal?: AbortSignal | undefined;
+}
+
+/** Download signed DTE XML bundles from the MIPYME "Respaldo de archivos" flow (`Portal001`,
+ *  `ORIGEN=ENV` emitted or `ORIGEN=RCP` received) over `[desde, hasta]`, bisecting ranges over
+ *  the 20-document cap and writing each bundle undecoded through `FileSink` (ADR-022). Returns
+ *  only descriptors (paths and counts), never the XML bytes (ADR-006). `signal` bounds the
+ *  multi-call walk between SII requests (ADR-031). */
+export async function dteXml(runtime: Runtime, args: DteXmlArgs): Promise<DteXmlResult> {
+  const empresa = Rut.parse(args.empresa);
+  const tipoDte = assertTipo(args.tipoDte);
+  if (args.origen !== 'ENV' && args.origen !== 'RCP') {
+    throw new ValidationError(
+      `Origen inválido: "${String(args.origen)}" (usa "ENV" para emitidos o "RCP" para recibidos).`,
+    );
+  }
+  for (const [k, v] of [
+    ['desde', args.desde],
+    ['hasta', args.hasta],
+  ] as const) {
+    if (!ISO_DATE.test(v)) {
+      throw new ValidationError(`--${k} inválida: "${v}" (formato YYYY-MM-DD).`);
+    }
+  }
+  if (args.desde > args.hasta) {
+    throw new ValidationError(
+      `Rango de fechas inválido: --desde (${args.desde}) debe ser menor o igual que --hasta (${args.hasta}).`,
+    );
+  }
+  if (args.tipoDoc !== undefined && (!Number.isInteger(args.tipoDoc) || args.tipoDoc <= 0)) {
+    throw new ValidationError(`--tipo-doc inválido: "${args.tipoDoc}" (entero positivo).`);
+  }
+  if (args.folio !== undefined && (!Number.isInteger(args.folio) || args.folio <= 0)) {
+    throw new ValidationError(`--folio inválido: "${args.folio}" (entero positivo).`);
+  }
+  if (
+    args.folioHasta !== undefined &&
+    (!Number.isInteger(args.folioHasta) || args.folioHasta <= 0)
+  ) {
+    throw new ValidationError(`--folio-hasta inválido: "${args.folioHasta}" (entero positivo).`);
+  }
+  if (args.folioHasta !== undefined && args.folio === undefined) {
+    throw new ValidationError('Si indicas --folio-hasta debes indicar también --folio.');
+  }
+  if (args.folio !== undefined && args.folioHasta !== undefined && args.folio > args.folioHasta) {
+    throw new ValidationError(
+      `Rango de folios inválido: --folio (${args.folio}) debe ser menor o igual que --folio-hasta (${args.folioHasta}).`,
+    );
+  }
+  const files = runtime.files;
+  if (!files) {
+    throw new DteError(
+      'Este runtime no tiene un FileSink configurado, así que no puede escribir el XML. ' +
+        'Usa `createNodeRuntime()` o inyecta `files`.',
+    );
+  }
+  const start = runtime.clock.now().getTime();
+  let tramosLeidos = 0;
+  try {
+    checkAborted(args.signal); // before opening the session: an expired deadline costs SII nothing
+    const res = await withBrowserSession(runtime, async (session) => {
+      const emp = await resolveAndSelectEmpresa(session, empresa, tipoDte, async () => {
+        checkAborted(args.signal);
+        await runtime.clock.sleep(pacingMs());
+        checkAborted(args.signal);
+      });
+      checkAborted(args.signal);
+      await runtime.clock.sleep(pacingMs());
+      checkAborted(args.signal);
+      const downloaded = await fetchDteXml(session, empresa, {
+        origen: args.origen,
+        desde: args.desde,
+        hasta: args.hasta,
+        ...(args.tipoDoc !== undefined ? { tipoDoc: args.tipoDoc } : {}),
+        ...(args.folio !== undefined ? { folio: args.folio } : {}),
+        ...(args.folioHasta !== undefined ? { folioHasta: args.folioHasta } : {}),
+        signal: args.signal,
+        sleep: () => runtime.clock.sleep(pacingMs()),
+        runRead: (fn) => readOnlyRetry(runtime, fn),
+      });
+      const archivos: DteXmlArchivo[] = [];
+      for (const tramo of downloaded.tramos) {
+        const tipoSuffix = tramo.tipoDoc !== undefined ? `-t${tramo.tipoDoc}` : '';
+        const folioSuffix =
+          args.folio !== undefined ? `-f${args.folio}-${args.folioHasta ?? args.folio}` : '';
+        const archivo = `dte-xml-${args.origen.toLowerCase()}-${empresa.canonical}-${tramo.desde}_${tramo.hasta}${tipoSuffix}${folioSuffix}-${tramo.documentos}.xml`;
+        const path = await files.write(args.directorio, archivo, tramo.bytes);
+        tramosLeidos += 1;
+        archivos.push({
+          path,
+          archivo,
+          bytes: tramo.bytes.length,
+          contentType: tramo.contentType,
+          desde: tramo.desde,
+          hasta: tramo.hasta,
+          documentos: tramo.documentos,
+          ...(tramo.tipoDoc !== undefined ? { tipoDoc: tramo.tipoDoc } : {}),
+        });
+      }
+      return {
+        empresa: emp,
+        origen: args.origen,
+        desde: args.desde,
+        hasta: args.hasta,
+        total: downloaded.total,
+        archivos,
+      };
+    });
+    audit(runtime, 'dte_xml', 'ok', {
+      rut: empresa.canonical,
+      origen: args.origen,
+      count: res.total,
+      tramos: res.archivos.length,
+      bytes: res.archivos.reduce((s, a) => s + a.bytes, 0),
+      durationMs: runtime.clock.now().getTime() - start,
+    });
+    return res;
+  } catch (e) {
+    const result = e instanceof AbortedError ? 'aborted' : 'failed';
+    audit(runtime, 'dte_xml', result, {
+      rut: empresa.canonical,
+      origen: args.origen,
+      ...(result === 'aborted' ? { tramos: tramosLeidos } : {}),
+    });
     throw e;
   }
 }

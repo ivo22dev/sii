@@ -22,6 +22,7 @@ import {
   dteBorradorList,
   dteBorradorSave,
   dtePreviewPdf,
+  dteXml,
 } from './dte.js';
 
 const SELF = '11111111-1';
@@ -552,5 +553,184 @@ describe('GH-93: emitidas/pdf follow the patterns settled in #90', () => {
       dtePdf(rt, { empresa: EMPRESA, codigo: '99999', directorio: '/tmp/docs' }),
     ).rejects.toThrow(/tras revisar 20 página\(s\), el tope del recorrido/);
     expect(reads).toHaveLength(20);
+  });
+});
+
+describe('dteXml (#169)', () => {
+  const XML_BYTES = new TextEncoder().encode(
+    '<?xml version="1.0" encoding="ISO-8859-1"?>\n<SetDTE version="1.0"><DTE version="1.0"><Documento ID="F7T33"></Documento></DTE></SetDTE>',
+  );
+
+  const xmlRuntime = (
+    countForRange: (desde: string, hasta: string) => number,
+    written: { path: string; bytes: Uint8Array }[] = [],
+  ): Runtime => ({
+    clock: new FixedClock(new Date('2026-09-08T12:00:00Z')),
+    audit: new RecordingAuditSink(),
+    store: new InMemoryKeyValueStore(),
+    files: {
+      write: async (dir: string, name: string, bytes: Uint8Array) => {
+        const path = `${dir}/${name}`;
+        written.push({ path, bytes });
+        return path;
+      },
+    } as FileSink,
+    ...bothEngines({
+      restoreSession: {
+        requestForm: (url: string) => {
+          if (url.includes('mipeSelEmpresa.cgi?')) return EMPRESAS_HTML;
+          if (url.includes('mipeSelEmpresa.cgi')) return '<html>formulario</html>';
+          return '';
+        },
+        requestText: (url: string, options?: { body?: string }) => {
+          if (url.includes('lista_documentos.cgi')) {
+            const params = new URLSearchParams(options?.body ?? '');
+            const d = params.get('FEC_DESDE') ?? '';
+            const h = params.get('FEC_HASTA') ?? '';
+            const n = countForRange(d, h);
+            return `<div id="cant_reg" value="${n}"></div>`;
+          }
+          return '';
+        },
+        requestBinary: () => ({
+          status: 200,
+          contentType: 'text/xml; charset=ISO-8859-1',
+          bytes: XML_BYTES,
+        }),
+      },
+    }),
+  });
+
+  it('validates inputs locally BEFORE opening any session', async () => {
+    const noSession: Runtime = {
+      clock: new FixedClock(new Date('2026-09-08T12:00:00Z')),
+      audit: new RecordingAuditSink(),
+      store: new InMemoryKeyValueStore(),
+      portal: new FakePortalDriver({}),
+      files: { write: async (dir: string, name: string) => `${dir}/${name}` } as FileSink,
+    };
+    await expect(
+      dteXml(noSession, {
+        empresa: EMPRESA,
+        directorio: '/tmp/docs',
+        origen: 'bad' as never,
+        desde: '2026-03-01',
+        hasta: '2026-03-31',
+      }),
+    ).rejects.toBeInstanceOf(ValidationError);
+    await expect(
+      dteXml(noSession, {
+        empresa: EMPRESA,
+        directorio: '/tmp/docs',
+        origen: 'ENV',
+        desde: '2026-03-01',
+        hasta: '2026-03-31',
+        folioHasta: 10,
+      }),
+    ).rejects.toBeInstanceOf(ValidationError);
+    await expect(
+      dteXml(noSession, {
+        empresa: EMPRESA,
+        directorio: '/tmp/docs',
+        origen: 'ENV',
+        desde: '2026-03-31',
+        hasta: '2026-03-01',
+      }),
+    ).rejects.toBeInstanceOf(ValidationError);
+    await expect(
+      dteXml(noSession, {
+        empresa: EMPRESA,
+        directorio: '/tmp/docs',
+        origen: 'ENV',
+        desde: '2026-03-01',
+        hasta: '2026-03-31',
+        tipoDoc: -1,
+      }),
+    ).rejects.toBeInstanceOf(ValidationError);
+  });
+
+  it('writes undecoded XML bytes through FileSink, returns descriptors only, and audits without PII', async () => {
+    const written: { path: string; bytes: Uint8Array }[] = [];
+    const rt = xmlRuntime(() => 5, written);
+    await seed(rt);
+
+    const res = await dteXml(rt, {
+      empresa: EMPRESA,
+      origen: 'ENV',
+      desde: '2026-03-01',
+      hasta: '2026-03-31',
+      tipoDoc: 33,
+      directorio: '/tmp/docs',
+    });
+
+    expect(res).toEqual({
+      empresa: { rut: EMPRESA, nombre: 'ACME SPA' },
+      origen: 'ENV',
+      desde: '2026-03-01',
+      hasta: '2026-03-31',
+      total: 5,
+      archivos: [
+        {
+          path: '/tmp/docs/dte-xml-env-76192083-9-2026-03-01_2026-03-31-t33-5.xml',
+          archivo: 'dte-xml-env-76192083-9-2026-03-01_2026-03-31-t33-5.xml',
+          bytes: XML_BYTES.length,
+          contentType: 'text/xml; charset=ISO-8859-1',
+          desde: '2026-03-01',
+          hasta: '2026-03-31',
+          documentos: 5,
+          tipoDoc: 33,
+        },
+      ],
+    });
+    expect(written).toHaveLength(1);
+    expect(written[0]?.bytes).toEqual(XML_BYTES);
+    expect(JSON.stringify(res)).not.toContain('SetDTE');
+
+    const a = entries(rt).at(-1)!;
+    expect(a).toMatchObject({
+      action: 'dte_xml',
+      result: 'ok',
+      origen: 'ENV',
+      tramos: 1,
+      count: 5,
+    });
+    expect(JSON.stringify(a)).not.toContain('ACME');
+  });
+
+  it('bisects across multiple files when count > 20 and returns empty archivos when count is 0', async () => {
+    const written: { path: string; bytes: Uint8Array }[] = [];
+    const rt = xmlRuntime((d, h) => {
+      if (d === '2026-03-01' && h === '2026-03-04') return 24;
+      if (d === '2026-03-01' && h === '2026-03-02') return 12;
+      if (d === '2026-03-03' && h === '2026-03-04') return 12;
+      return 0;
+    }, written);
+    await seed(rt);
+
+    const res = await dteXml(rt, {
+      empresa: EMPRESA,
+      origen: 'RCP',
+      desde: '2026-03-01',
+      hasta: '2026-03-04',
+      directorio: '/tmp/docs',
+    });
+    expect(res.total).toBe(24);
+    expect(res.archivos).toHaveLength(2);
+    expect(res.archivos.map((a) => a.archivo)).toEqual([
+      'dte-xml-rcp-76192083-9-2026-03-01_2026-03-02-12.xml',
+      'dte-xml-rcp-76192083-9-2026-03-03_2026-03-04-12.xml',
+    ]);
+
+    const emptyRt = xmlRuntime(() => 0);
+    await seed(emptyRt);
+    const emptyRes = await dteXml(emptyRt, {
+      empresa: EMPRESA,
+      origen: 'ENV',
+      desde: '2026-04-01',
+      hasta: '2026-04-30',
+      directorio: '/tmp/docs',
+    });
+    expect(emptyRes.total).toBe(0);
+    expect(emptyRes.archivos).toEqual([]);
   });
 });

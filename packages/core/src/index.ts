@@ -101,6 +101,8 @@ export {
   dtePreviewPdf,
   dteEmitidos,
   dtePdf,
+  dteXml,
+  DTE_XML_MAX_DOCS,
   TIPOS_DTE,
   MAX_ITEMS,
 } from './tasks/dte.js';
@@ -119,6 +121,10 @@ export type {
   EstadoEmitido,
   DteSelectAviso,
   DteTotales,
+  DteXmlArchivo,
+  DteXmlArgs,
+  DteXmlOrigen,
+  DteXmlResult,
   FormaPago,
   TipoDte,
 } from './tasks/dte.js';

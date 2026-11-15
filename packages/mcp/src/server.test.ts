@@ -46,6 +46,7 @@ describe('@albertomarturelo/sii-mcp server (in-memory client, fake runtime, no S
       'dte_empresas',
       'dte_pdf',
       'dte_preview_pdf',
+      'dte_xml',
       'f22_formulario',
       'f22_historial',
       'f22_observaciones',

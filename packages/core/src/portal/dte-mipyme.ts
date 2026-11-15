@@ -24,7 +24,8 @@
 // instead of the select) and the session is already scoped; then the empresa is read off the
 // factura form's DTE header box and nothing is POSTed (observed 2026-09-09, #95).
 import { HOSTS } from '../config/index.js';
-import { DteError } from '../errors/index.js';
+import { checkAborted } from '../errors/abort.js';
+import { DteError, SessionExpiredError } from '../errors/index.js';
 import { repairMojibake } from '../format/text.js';
 import { Rut } from '../rut/index.js';
 import type { PortalSession, PublicResponse } from '../seams/index.js';
@@ -1107,4 +1108,333 @@ export async function fetchPreviewPdf(
     );
   }
   return res.bytes;
+}
+
+// --- Respaldo XML (lista_documentos.cgi + download.cgi, #169) ------------------------
+
+/** "Respaldo de archivos MIPYME" listing and count CGI (observed at
+ *  https://www1.sii.cl/cgi-bin/Portal001/lista_documentos.cgi on 2026-10-25). */
+const RESPALDO_LISTA_URL = `${CGI}/lista_documentos.cgi`;
+/** Signed DTE XML download CGI (observed at
+ *  https://www1.sii.cl/cgi-bin/Portal001/download.cgi on 2026-10-25). */
+const RESPALDO_DOWNLOAD_URL = `${CGI}/download.cgi`;
+
+/** Hard ceiling enforced by `lista_documentos.cgi`: `cant_reg > 20` hides `#btn_respaldar` and
+ *  `download.cgi` answers an HTML error page instead of XML (observed 2026-10-25). */
+export const DTE_XML_MAX_DOCS = 20;
+
+/** DTE codes used to partition a single day that exceeds `DTE_XML_MAX_DOCS` (`<select id="combo">`
+ *  options on `lista_documentos.cgi` plus export codes 110/111/112, observed 2026-10-25). */
+export const TIPOS_DOC_XML: readonly number[] = [33, 34, 46, 56, 61, 52, 110, 111, 112];
+
+/** `ORIGEN` values on `lista_documentos.cgi` (observed 2026-10-25): `ENV` = emitidos,
+ *  `RCP` = recibidos. */
+export type DteXmlOrigen = 'ENV' | 'RCP';
+
+export interface DteXmlTramoPlan {
+  readonly desde: string;
+  readonly hasta: string;
+  readonly documentos: number;
+  readonly tipoDoc?: number;
+}
+
+export interface DteXmlTramoBytes extends DteXmlTramoPlan {
+  readonly bytes: Uint8Array;
+  readonly contentType: string;
+}
+
+export interface FetchDteXmlOptions {
+  readonly origen: DteXmlOrigen;
+  readonly desde: string;
+  readonly hasta: string;
+  readonly tipoDoc?: number;
+  readonly folio?: number;
+  readonly folioHasta?: number;
+  readonly signal?: AbortSignal | undefined;
+  readonly sleep?: () => Promise<void>;
+  readonly runRead?: <T>(fn: () => Promise<T>) => Promise<T>;
+  readonly onRequest?: () => void;
+}
+
+const RESPALDO_LISTA_HEADERS = {
+  'Content-Type': 'application/x-www-form-urlencoded; charset=ISO-8859-1',
+  Origin: MIPE_ORIGIN,
+  Referer: RESPALDO_LISTA_URL,
+} as const;
+
+/** Extract `alert('…')` messages from a `Portal001` error page while ignoring `//`-commented lines:
+ *  the valid `lista_documentos.cgi` template includes a commented-out
+ *  `//alert("Maximo numero de docmentos para respaldar: 20. Reduzca la cantidad usando el filtro.");`
+ *  and `//alert(urldata);` (observed 2026-10-25). */
+export function extractRespaldoAlerts(html = ''): string[] {
+  const out: string[] = [];
+  const re = /alert\s*\(\s*(['"])([\s\S]*?)\1\s*\)/g;
+  for (let m = re.exec(html); m !== null; m = re.exec(html)) {
+    const lineStart = html.lastIndexOf('\n', m.index) + 1;
+    const before = html.slice(lineStart, m.index);
+    if (/\/\//.test(before.replace(/[a-z]+:\/\//gi, ''))) continue;
+    const text = (m[2] ?? '')
+      .replace(/\\(['"\\])/g, '$1')
+      .replace(/\\[rnt]/g, ' ')
+      .replace(/&nbsp;/gi, ' ')
+      .replace(/&aacute;/gi, 'á')
+      .replace(/&eacute;/gi, 'é')
+      .replace(/&iacute;/gi, 'í')
+      .replace(/&oacute;/gi, 'ó')
+      .replace(/&uacute;/gi, 'ú')
+      .replace(/&ntilde;/gi, 'ñ')
+      .replace(/&amp;/gi, '&')
+      .replace(/<[^>]+>/g, ' ')
+      .replace(/\s+/g, ' ')
+      .trim();
+    if (text) out.push(text);
+  }
+  return out;
+}
+
+/** Read the total document count from `lista_documentos.cgi` HTML: both
+ *  `<div id="cant_reg" value="N"></div>` and
+ *  `N&uacute;mero total de documentos <span id="origen_doc"></span>: N` appear on the page
+ *  (observed 2026-10-25). Returns `null` when neither marker is present. */
+export function parseRespaldoDocCount(html: string): number | null {
+  const attr = /id=["']cant_reg["'][^>]*\bvalue=["'](\d+)["']/i.exec(html)?.[1];
+  if (attr !== undefined) return parseInt(attr, 10);
+  const label = /total de documentos[^0-9]{0,120}(\d+)/i.exec(html)?.[1];
+  return label !== undefined ? parseInt(label, 10) : null;
+}
+
+/** Classify a non-success HTML response from `lista_documentos.cgi` or `download.cgi` into a
+ *  `SessionExpiredError` (when SII rejects the session) or `DteError` with SII's verbatim message
+ *  when present (ADR-004). */
+export function dteXmlErrorFromHtml(html: string, step: string): DteError | SessionExpiredError {
+  const alerts = extractRespaldoAlerts(html);
+  if (alerts.length === 1 && alerts[0]) {
+    if (/sesi[oó]n no v[aá]lida/i.test(alerts[0])) {
+      return new SessionExpiredError(`El SII rechazó la sesión (${step}): ${alerts[0]}`);
+    }
+    return new DteError(`El SII rechazó la consulta (${step}): ${alerts[0]}`);
+  }
+  if (alerts.length > 1) {
+    return new DteError(
+      `El Portal MIPYME devolvió una plantilla con ${alerts.length} alertas sin veredicto único (${step}): ${alerts.join(' | ')}`,
+    );
+  }
+  if (/AUT2000|IngresoRutClave|zeusr\.sii\.cl/i.test(html)) {
+    return new SessionExpiredError(`La sesión del SII expiró durante el respaldo XML (${step}).`);
+  }
+  if (/recaptcha/i.test(html) && !/RESPALDO DE ARCHIVOS MIPYME/i.test(html)) {
+    return new DteError(
+      'El SII activó reCAPTCHA en el respaldo MIPYME: no se puede automatizar mientras esté activo.',
+    );
+  }
+  if (/Seleccionar empresa/i.test(html)) {
+    return new DteError(
+      `El Portal MIPYME devolvió la página "Seleccionar empresa" sin mensaje durante ${step}.`,
+    );
+  }
+  return new DteError(
+    `El SII no entregó una respuesta reconocida en el respaldo XML (${step}). Puede que la sesión ya no esté viva o que el portal haya cambiado.`,
+  );
+}
+
+/** `download.cgi` serves an ISO-8859-1 XML bundle starting with `<?xml` or `<SetDTE>` / `<EnvioDTE>`
+ *  (observed 2026-10-25). Status is never a success signal: SII answers 200 for HTML alert pages. */
+export function isXmlBytes(bytes: Uint8Array, contentType: string | null): boolean {
+  if ((contentType ?? '').toLowerCase().includes('text/html')) return false;
+  const head = new TextDecoder('iso-8859-1').decode(bytes.subarray(0, 256)).trimStart();
+  return head.startsWith('<?xml') || head.startsWith('<SetDTE') || head.startsWith('<EnvioDTE');
+}
+
+const toDayUtc = (s: string): Date => new Date(`${s}T00:00:00Z`);
+const toIsoDay = (d: Date): string => d.toISOString().slice(0, 10);
+
+/** Plan download tramos so every tramo has `<= DTE_XML_MAX_DOCS` documents, bisecting by date
+ *  first and partitioning by `TPO_DOC` when a single day still exceeds the cap (#169). */
+export async function planDteXmlTramos(
+  desde: string,
+  hasta: string,
+  count: (d: string, h: string, tipoDoc?: number) => Promise<number>,
+  tipoDocFijo?: number,
+): Promise<DteXmlTramoPlan[]> {
+  const tramos: DteXmlTramoPlan[] = [];
+
+  const splitRange = async (d: string, h: string): Promise<void> => {
+    const n = await count(d, h, tipoDocFijo);
+    if (n === 0) return;
+    if (n <= DTE_XML_MAX_DOCS) {
+      tramos.push({
+        desde: d,
+        hasta: h,
+        documentos: n,
+        ...(tipoDocFijo !== undefined ? { tipoDoc: tipoDocFijo } : {}),
+      });
+      return;
+    }
+    const mid = toIsoDay(new Date((toDayUtc(d).getTime() + toDayUtc(h).getTime()) / 2));
+    if (mid === h || mid === d) {
+      if (tipoDocFijo !== undefined) {
+        throw new DteError(
+          `El ${d} tiene ${n} documentos tipo ${tipoDocFijo} y el SII solo permite ${DTE_XML_MAX_DOCS} por descarga. Acota con --folio / --folio-hasta.`,
+        );
+      }
+      let covered = 0;
+      for (const tipo of TIPOS_DOC_XML) {
+        const nTipo = await count(d, h, tipo);
+        if (nTipo === 0) continue;
+        if (nTipo > DTE_XML_MAX_DOCS) {
+          throw new DteError(
+            `El ${d} tiene ${nTipo} documentos tipo ${tipo} y el SII solo permite ${DTE_XML_MAX_DOCS} por descarga. No es divisible por fecha ni por tipo.`,
+          );
+        }
+        tramos.push({ desde: d, hasta: d, documentos: nTipo, tipoDoc: tipo });
+        covered += nTipo;
+      }
+      if (covered < n) {
+        throw new DteError(
+          `El ${d} tiene ${n} documentos pero solo se identificaron ${covered} entre los tipos conocidos (${TIPOS_DOC_XML.join(', ')}).`,
+        );
+      }
+      return;
+    }
+    const nextDay = toIsoDay(new Date(toDayUtc(mid).getTime() + 86_400_000));
+    await splitRange(d, mid);
+    await splitRange(nextDay, h);
+  };
+
+  await splitRange(desde, hasta);
+  return tramos;
+}
+
+/** Download the signed DTE XML bundles for `empresa` over `[desde, hasta]` from `Portal001`
+ *  (`lista_documentos.cgi` → `download.cgi?…&DOWNLOAD=XML`). The caller must have selected the
+ *  empresa in the session first (`resolveAndSelectEmpresa`). Every request is paced via `sleep`,
+ *  and `signal` is checked before and after each pause (ADR-031). */
+export async function fetchDteXml(
+  session: PortalSession,
+  empresa: Rut,
+  options: FetchDteXmlOptions,
+): Promise<{ total: number; tramos: DteXmlTramoBytes[] }> {
+  const {
+    origen,
+    desde,
+    hasta,
+    tipoDoc,
+    folio,
+    folioHasta,
+    signal,
+    sleep = () => Promise.resolve(),
+    runRead = <T>(fn: () => Promise<T>): Promise<T> => fn(),
+    onRequest,
+  } = options;
+
+  const folioStr = folio !== undefined ? String(folio) : '';
+  const folioHastaStr =
+    folioHasta !== undefined ? String(folioHasta) : folio !== undefined ? String(folio) : '';
+
+  const baseFields = (d: string, h: string, tipo?: number): Record<string, string> => ({
+    RUT_EMP: String(empresa.body),
+    DV_EMP: empresa.dv,
+    RUT_RECP: '',
+    FOLIO: folioStr,
+    FOLIOHASTA: folioHastaStr,
+    RZN_SOC: '',
+    TPO_DOC: tipo !== undefined ? String(tipo) : '',
+    ESTADO: '',
+    ORDEN: '',
+    FEC_DESDE: folioStr ? '' : d,
+    FEC_HASTA: folioStr ? '' : h,
+  });
+
+  let callIndex = 0;
+  const paceIfNeeded = async (): Promise<void> => {
+    if (callIndex > 0) {
+      checkAborted(signal);
+      await sleep();
+    }
+    checkAborted(signal);
+    callIndex += 1;
+  };
+
+  const countRange = async (d: string, h: string, tipo?: number): Promise<number> => {
+    await paceIfNeeded();
+    const fields: Record<string, string> = {
+      'recaptcha-response': '',
+      ORIGEN: origen,
+      NUM_PAG: '1',
+      TPO_ARCHIVO: 'dte',
+      ...baseFields(d, h, tipo),
+    };
+    const res = await runRead(() =>
+      session.requestText(RESPALDO_LISTA_URL, {
+        method: 'POST',
+        headers: RESPALDO_LISTA_HEADERS,
+        body: latin1FormBody(Object.entries(fields)),
+      }),
+    );
+    onRequest?.();
+    const total = parseRespaldoDocCount(res.body);
+    if (total !== null) return total;
+    throw dteXmlErrorFromHtml(
+      res.body,
+      `listado ${d}..${h}${tipo !== undefined ? ` tipo=${tipo}` : ''}`,
+    );
+  };
+
+  const downloadTramo = async (plan: DteXmlTramoPlan): Promise<DteXmlTramoBytes> => {
+    await paceIfNeeded();
+    const qs = new URLSearchParams({
+      ...baseFields(plan.desde, plan.hasta, plan.tipoDoc),
+      ORIGEN: origen,
+      DOWNLOAD: 'XML',
+    });
+    const res = await runRead(() =>
+      session.requestBinary(`${RESPALDO_DOWNLOAD_URL}?${qs.toString()}`, {
+        method: 'GET',
+        headers: { Referer: RESPALDO_LISTA_URL },
+      }),
+    );
+    onRequest?.();
+    if (!isXmlBytes(res.bytes, res.contentType)) {
+      const html = new TextDecoder('iso-8859-1').decode(res.bytes);
+      throw dteXmlErrorFromHtml(
+        html,
+        `descarga ${plan.desde}..${plan.hasta}${plan.tipoDoc !== undefined ? ` tipo=${plan.tipoDoc}` : ''}`,
+      );
+    }
+    return {
+      ...plan,
+      bytes: res.bytes,
+      contentType: res.contentType ?? 'text/xml; charset=ISO-8859-1',
+    };
+  };
+
+  const plans =
+    folio !== undefined
+      ? await (async (): Promise<DteXmlTramoPlan[]> => {
+          const n = await countRange(desde, hasta, tipoDoc);
+          if (n === 0) return [];
+          if (n > DTE_XML_MAX_DOCS) {
+            throw new DteError(
+              `El rango de folios ${folioStr}..${folioHastaStr} tiene ${n} documentos y el SII solo permite ${DTE_XML_MAX_DOCS} por descarga. Acota el rango de folios.`,
+            );
+          }
+          return [
+            {
+              desde,
+              hasta,
+              documentos: n,
+              ...(tipoDoc !== undefined ? { tipoDoc } : {}),
+            },
+          ];
+        })()
+      : await planDteXmlTramos(desde, hasta, countRange, tipoDoc);
+
+  const tramos: DteXmlTramoBytes[] = [];
+  let total = 0;
+  for (const plan of plans) {
+    const downloaded = await downloadTramo(plan);
+    total += downloaded.documentos;
+    tramos.push(downloaded);
+  }
+  return { total, tramos };
 }

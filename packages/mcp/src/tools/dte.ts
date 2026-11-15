@@ -19,6 +19,7 @@ import {
   dteEmpresas,
   dtePdf,
   dtePreviewPdf,
+  dteXml,
   type DteBorradorArgs,
   type FormaPago,
   type Runtime,
@@ -313,5 +314,62 @@ export function registerDteTools(server: McpServer, runtime: Runtime): void {
         ),
       );
     },
+  );
+
+  server.registerTool(
+    'dte_xml',
+    {
+      description:
+        'Empresa-keyed (--empresa validado contra el Portal MIPYME). Descarga los XML firmados ' +
+        '(<SetDTE> / <EnvioDTE>) de documentos EMITIDOS (ENV) o RECIBIDOS (RCP) desde Respaldo ' +
+        'MIPYME. Bisecciona automáticamente por fecha y tipo de DTE cuando el rango supera el ' +
+        'tope de 20 documentos del portal. Devuelve las RUTAS de los archivos descargados, ' +
+        'nunca su contenido XML: el documento contiene PII densa (identidad de ambas partes, ' +
+        'ítems, montos y firma electrónica) y no debe entrar al contexto del modelo. Sólo ' +
+        'lectura en el SII (no emite ni firma nada).',
+      inputSchema: {
+        empresa: z.string().describe('RUT de la empresa en el Portal MIPYME (de `dte_empresas`).'),
+        origen: z
+          .enum(['ENV', 'RCP', 'env', 'rcp'])
+          .optional()
+          .describe('ENV (emitidos, por defecto) | RCP (recibidos en Portal MIPYME).'),
+        desde: z.string().describe('YYYY-MM-DD.'),
+        hasta: z.string().describe('YYYY-MM-DD.'),
+        tipoDoc: z
+          .number()
+          .int()
+          .optional()
+          .describe('Tipo de DTE (33, 34, 46, 52, 56, 61, 110, 111, 112).'),
+        folio: z.number().int().positive().optional().describe('Folio inicial o único.'),
+        folioHasta: z
+          .number()
+          .int()
+          .positive()
+          .optional()
+          .describe('Folio final (requiere `folio`).'),
+        directorio: z
+          .string()
+          .optional()
+          .describe('Carpeta destino; por defecto documentos/dte bajo $SII_HOME (o ~/.sii).'),
+      },
+      annotations: { readOnlyHint: false },
+    },
+    async ({ empresa, origen, desde, hasta, tipoDoc, folio, folioHasta, directorio }) =>
+      toolText(async () =>
+        JSON.stringify(
+          await dteXml(runtime, {
+            empresa,
+            origen: (origen ?? 'ENV').toUpperCase() === 'RCP' ? 'RCP' : 'ENV',
+            desde,
+            hasta,
+            directorio: directorio ?? join(documentosDir(), 'dte'),
+            ...(tipoDoc !== undefined ? { tipoDoc } : {}),
+            ...(folio !== undefined ? { folio } : {}),
+            ...(folioHasta !== undefined ? { folioHasta } : {}),
+          }),
+          null,
+          2,
+        ),
+      ),
   );
 }
