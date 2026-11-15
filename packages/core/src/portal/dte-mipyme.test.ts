@@ -3,18 +3,24 @@
 // Mod-11-valid RUTs only — never real PII.
 import { describe, expect, it } from 'vitest';
 import { FakePortalSession } from '../adapters/fake/index.js';
-import { DteError } from '../errors/index.js';
+import { DteError, SessionExpiredError } from '../errors/index.js';
 import { LOGIN_HOST } from '../config/index.js';
 import { Rut } from '../rut/index.js';
 import {
+  dteXmlErrorFromHtml,
   eliminaBorrador,
+  extractRespaldoAlerts,
+  fetchDteXml,
   fetchEmitidaPdf,
   fetchEmitidas,
   parseEmitidas,
   fetchBorradores,
   fetchEmpresas,
   fetchPreviewPdf,
+  isXmlBytes,
   parseChooser,
+  parseRespaldoDocCount,
+  planDteXmlTramos,
   fillFactura,
   grabaBorrador,
   loadBorrador,
@@ -762,5 +768,244 @@ describe('GH-95 review: identity resolution is independent of the requested DTE 
     expect(s.gotos).toEqual([expect.stringContaining('PTDC_CODIGO=33')]);
     // the chooser GET still asks for the requested type
     expect(s.lastFormRequest?.url).toContain(encodeURIComponent('OPCION=34'));
+  });
+});
+
+// --- Respaldo XML (#169) ------------------------------------------------------------
+describe('Respaldo XML (#169)', () => {
+  const LISTA_DOC_HTML = (count: number) => `<!DOCTYPE HTML>
+<html><head><script>
+function bajarArchivo() {
+  // alert("Descargando el archivo");
+  document.myForm.submit();
+}
+</script></head><body>
+<div id="cant_reg" value="${count}"></div>
+<div class="alert alert-success">
+  <strong>N&uacute;mero total de documentos <span id="origen_doc"></span>: ${count}</strong>
+</div>
+</body></html>`;
+
+  const SAMPLE_XML_BYTES = new Uint8Array([
+    ...new TextEncoder().encode(
+      '<?xml version="1.0" encoding="ISO-8859-1"?>\n<SetDTE version="1.0"><Caratula><RutEmisor>76192083-9</RutEmisor></Caratula><DTE version="1.0"><Documento ID="F1T33"><Encabezado><Emisor><RznSoc>ASESOR',
+    ),
+    0xcd, // 'Í' in ISO-8859-1
+    ...new TextEncoder().encode('A SINT'),
+    0xc9, // 'É' in ISO-8859-1
+    ...new TextEncoder().encode(
+      'TICA SPA</RznSoc></Emisor></Encabezado></Documento></DTE></SetDTE>',
+    ),
+  ]);
+
+  it('extractRespaldoAlerts ignores commented-out alerts and extracts single/multiple active alerts', () => {
+    expect(extractRespaldoAlerts(LISTA_DOC_HTML(8))).toEqual([]);
+    expect(
+      extractRespaldoAlerts(
+        "<script>alert('No existen documentos con los criterios seleccionados');window.history.go(-1);</script>",
+      ),
+    ).toEqual(['No existen documentos con los criterios seleccionados']);
+    expect(
+      extractRespaldoAlerts(
+        "<script>alert('No ha sido posible completar su solicitud.');alert('CODIGO: 02.35.209');</script>",
+      ),
+    ).toEqual(['No ha sido posible completar su solicitud.', 'CODIGO: 02.35.209']);
+  });
+
+  it('parseRespaldoDocCount parses #cant_reg and falls back to the banner text', () => {
+    expect(parseRespaldoDocCount(LISTA_DOC_HTML(14))).toBe(14);
+    expect(parseRespaldoDocCount(LISTA_DOC_HTML(0))).toBe(0);
+    expect(
+      parseRespaldoDocCount(
+        '<strong>N&uacute;mero total de documentos <span id="origen_doc"></span>: 25</strong>',
+      ),
+    ).toBe(25);
+    expect(parseRespaldoDocCount('<html>mantención</html>')).toBeNull();
+  });
+
+  it('dteXmlErrorFromHtml classifies sesion-muerta, alerts, reCAPTCHA, and Seleccionar empresa', () => {
+    expect(
+      dteXmlErrorFromHtml("<script>alert('Sesión no válida');</script>", 'listado'),
+    ).toBeInstanceOf(SessionExpiredError);
+    expect(
+      dteXmlErrorFromHtml(
+        '<html><form action="https://zeusr.sii.cl/AUT2000/"></form></html>',
+        'listado',
+      ),
+    ).toBeInstanceOf(SessionExpiredError);
+    const alertErr = dteXmlErrorFromHtml(
+      "<script>alert('No ha sido posible completar su solicitud.');alert('CODIGO: 02.35.209');</script>",
+      'descarga',
+    );
+    expect(alertErr).toBeInstanceOf(DteError);
+    expect(alertErr.message).toContain(
+      'No ha sido posible completar su solicitud. | CODIGO: 02.35.209',
+    );
+    expect(dteXmlErrorFromHtml('<div class="g-recaptcha"></div>', 'listado').message).toMatch(
+      /recaptcha/i,
+    );
+    expect(
+      dteXmlErrorFromHtml('<html><title>Seleccionar empresa</title></html>', 'listado'),
+    ).toBeInstanceOf(DteError);
+  });
+
+  it('isXmlBytes accepts XML prolog or root DTE elements and rejects HTML', () => {
+    expect(isXmlBytes(SAMPLE_XML_BYTES, 'text/xml; charset=ISO-8859-1')).toBe(true);
+    expect(isXmlBytes(new TextEncoder().encode('<EnvioDTE version="1.0"></EnvioDTE>'), null)).toBe(
+      true,
+    );
+    expect(
+      isXmlBytes(new TextEncoder().encode('<html><body>Error</body></html>'), 'text/html'),
+    ).toBe(false);
+    expect(isXmlBytes(new Uint8Array(), null)).toBe(false);
+  });
+
+  it('scenario con-datos: fetchDteXml returns 1 tramo when count <= 20 and preserves raw ISO-8859-1 bytes', async () => {
+    const s = new FakePortalSession({
+      requestText: () => LISTA_DOC_HTML(8),
+      requestBinary: () => SAMPLE_XML_BYTES,
+    });
+    const res = await fetchDteXml(s, Rut.parse('76192083-9'), {
+      origen: 'ENV',
+      desde: '2026-03-01',
+      hasta: '2026-03-31',
+    });
+    expect(res.total).toBe(8);
+    expect(res.tramos).toHaveLength(1);
+    expect(res.tramos[0]?.bytes).toEqual(SAMPLE_XML_BYTES);
+    // Raw Latin-1 byte 0xCD ('Í') is preserved untouched (never re-encoded to UTF-8 0xC3 0x8D).
+    expect(res.tramos[0]?.bytes.includes(0xcd)).toBe(true);
+    expect(s.lastBinaryRequest?.url).toContain('download.cgi');
+    expect(s.lastBinaryRequest?.url).toContain('ORIGEN=ENV');
+    expect(s.lastBinaryRequest?.url).toContain('DOWNLOAD=XML');
+  });
+
+  it('scenario vacio: fetchDteXml returns empty tramos when count is 0 without calling download.cgi', async () => {
+    const s = new FakePortalSession({ requestText: () => LISTA_DOC_HTML(0) });
+    const res = await fetchDteXml(s, Rut.parse('76192083-9'), {
+      origen: 'RCP',
+      desde: '2026-03-01',
+      hasta: '2026-03-31',
+    });
+    expect(res).toEqual({ total: 0, tramos: [] });
+    expect(s.lastBinaryRequest).toBeNull();
+  });
+
+  it('scenario inesperado: fails with DteError when lista_documentos.cgi changes shape or download.cgi returns HTML', async () => {
+    const badList = new FakePortalSession({ requestText: () => '<html>mantención</html>' });
+    await expect(
+      fetchDteXml(badList, Rut.parse('76192083-9'), {
+        origen: 'ENV',
+        desde: '2026-03-01',
+        hasta: '2026-03-31',
+      }),
+    ).rejects.toThrow(/no entregó una respuesta reconocida/);
+
+    const badDownload = new FakePortalSession({
+      requestText: () => LISTA_DOC_HTML(2),
+      requestBinary: () => ({
+        status: 200,
+        contentType: 'text/html; charset=ISO-8859-1',
+        bytes: new TextEncoder().encode(
+          "<script>alert('No existen documentos con los criterios seleccionados');</script>",
+        ),
+      }),
+    });
+    await expect(
+      fetchDteXml(badDownload, Rut.parse('76192083-9'), {
+        origen: 'ENV',
+        desde: '2026-03-01',
+        hasta: '2026-03-31',
+        folio: 10,
+      }),
+    ).rejects.toThrow(/No existen documentos con los criterios seleccionados/);
+  });
+
+  it('scenario sesion-muerta: raises SessionExpiredError when SII answers Sesión no válida', async () => {
+    const dead = new FakePortalSession({
+      requestText: () => "<script>alert('Sesión no válida');</script>",
+    });
+    await expect(
+      fetchDteXml(dead, Rut.parse('76192083-9'), {
+        origen: 'ENV',
+        desde: '2026-03-01',
+        hasta: '2026-03-31',
+      }),
+    ).rejects.toBeInstanceOf(SessionExpiredError);
+  });
+
+  it('bisects date ranges when count > 20', async () => {
+    const queries: string[] = [];
+    const tramos = await planDteXmlTramos('2026-03-01', '2026-03-04', async (d, h) => {
+      queries.push(`${d}..${h}`);
+      if (d === '2026-03-01' && h === '2026-03-04') return 28;
+      if (d === '2026-03-01' && h === '2026-03-02') return 15;
+      if (d === '2026-03-03' && h === '2026-03-04') return 13;
+      return 0;
+    });
+    expect(queries).toEqual([
+      '2026-03-01..2026-03-04',
+      '2026-03-01..2026-03-02',
+      '2026-03-03..2026-03-04',
+    ]);
+    expect(tramos).toEqual([
+      { desde: '2026-03-01', hasta: '2026-03-02', documentos: 15 },
+      { desde: '2026-03-03', hasta: '2026-03-04', documentos: 13 },
+    ]);
+  });
+
+  it('bisects by TPO_DOC when a single day exceeds 20 documents without a tipoDoc filter', async () => {
+    const tramos = await planDteXmlTramos('2026-03-10', '2026-03-10', async (_d, _h, tipo) => {
+      if (tipo === undefined) return 25;
+      if (tipo === 33) return 18;
+      if (tipo === 61) return 7;
+      return 0;
+    });
+    expect(tramos).toEqual([
+      { desde: '2026-03-10', hasta: '2026-03-10', documentos: 18, tipoDoc: 33 },
+      { desde: '2026-03-10', hasta: '2026-03-10', documentos: 7, tipoDoc: 61 },
+    ]);
+  });
+
+  it('refuses when a single day + single tipoDoc still exceeds 20 documents', async () => {
+    await expect(planDteXmlTramos('2026-03-10', '2026-03-10', async () => 21, 33)).rejects.toThrow(
+      /tiene 21 documentos tipo 33 y el SII solo permite 20/,
+    );
+  });
+
+  it('honors AbortSignal between bisection queries (ADR-031)', async () => {
+    const controller = new AbortController();
+    const s = new FakePortalSession({
+      requestText: () => {
+        controller.abort(new Error('operación cancelada'));
+        return LISTA_DOC_HTML(25);
+      },
+    });
+    await expect(
+      fetchDteXml(s, Rut.parse('76192083-9'), {
+        origen: 'ENV',
+        desde: '2026-03-01',
+        hasta: '2026-03-04',
+        signal: controller.signal,
+      }),
+    ).rejects.toThrow(/se detuvo antes de la siguiente llamada/i);
+  });
+
+  it('clears FEC_DESDE and FEC_HASTA when folio is set (matching verificaCampos)', async () => {
+    const s = new FakePortalSession({
+      requestText: () => LISTA_DOC_HTML(1),
+      requestBinary: () => SAMPLE_XML_BYTES,
+    });
+    await fetchDteXml(s, Rut.parse('76192083-9'), {
+      origen: 'ENV',
+      desde: '2026-03-01',
+      hasta: '2026-03-31',
+      folio: 42,
+    });
+    const body = s.lastTextRequest?.options?.body ?? '';
+    expect(body).toContain('FOLIO=42');
+    expect(body).toContain('FOLIOHASTA=42');
+    expect(body).toContain('FEC_DESDE=&');
+    expect(body).toContain('FEC_HASTA=');
   });
 });

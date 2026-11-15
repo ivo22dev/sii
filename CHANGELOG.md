@@ -23,6 +23,8 @@ Every decision behind a release is recorded as an ADR under
      in each package's changelog, and leaves only this comment; release.yml refuses a tag
      while an entry remains. -->
 
+- **Added:** `sii dte xml` (MCP `dte_xml`, core `dteXml`) downloads signed DTE XML sets (`<SetDTE>` / `<EnvioDTE>`) from Respaldo MIPYME (`env` issued or `rcp` received), bisecting automatically by date and `TPO_DOC` above SII's 20-document cap and writing undecoded ISO-8859-1 bytes through `FileSink` (#169).
+
 ## 0.20.0 — 2026-11-13 — La reparación
 
 A minor for one export (#279).

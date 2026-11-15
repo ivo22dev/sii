@@ -363,3 +363,105 @@ function goSignDTE(btn) { document.forms["PreViewDTE"].action = "/cgi-bin/Portal
 **Notable:** signing is **server-side**. There is no applet, no browser certificate, no
 `.pfx` — the Clave Tributaria session alone is enough for SII to sign and emit a legally-binding
 factura. That is precisely why this codebase stops at the borrador (ADR-023).
+
+## 8. Respaldo XML — `lista_documentos.cgi` and `download.cgi` (#169)
+
+Reached from *Respaldo de documentos emitidos/recibidos* on `Portal001` (`www1.sii.cl/cgi-bin/Portal001/`).
+**Observed first-hand 2026-10-25** on a Clave Tributaria session scoped to an empresa via
+`mipeSelEmpresa.cgi` (§ 1). No certificado digital is required on the client.
+
+### 8.1 Listing and count — `lista_documentos.cgi`
+
+```
+POST /cgi-bin/Portal001/lista_documentos.cgi
+Content-Type: application/x-www-form-urlencoded; charset=ISO-8859-1
+Origin: https://www1.sii.cl
+Referer: https://www1.sii.cl/cgi-bin/Portal001/lista_documentos.cgi
+```
+
+Form fields (`FormNameAdmEmi`, observed in the page HTML):
+
+| Field | Values / meaning |
+| --- | --- |
+| `recaptcha-response` | Sent empty (`""`). |
+| `ORIGEN` | `ENV` = emitidos (ventas), `RCP` = recibidos (compras). |
+| `TPO_DOC` | Optional DTE code (`""` = all; `<select id="combo">` offers `33`, `34`, `46`, `56`, `61`, `52`; export codes `110`, `111`, `112` also accepted by the CGI). |
+| `FEC_DESDE`, `FEC_HASTA` | `YYYY-MM-DD` emission date range (`maxlength="10"`). |
+| `FOLIO`, `FOLIOHASTA` | Optional folio range (`maxlength="10"`). The client validator `verificaCampos()` requires both when either is set, and forbids combining a folio range with a date range (`Si ingresa rango de folios, no puede ingresar rango de fechas`). |
+| `RUT_RECP` | Optional counterparty RUT **body digits only**, no dots and no DV (`maxlength="8"`). |
+| `RZN_SOC` | Optional counterparty razón social (`""`). |
+| `ESTADO`, `ORDEN` | Hidden inputs, sent empty (`""`). |
+| `NUM_PAG` | Page number (`"1"`). |
+| `RUT_EMP`, `DV_EMP` | Selected empresa RUT body and DV (hidden inputs `#rut_emp`, `#dv_emp`). |
+| `TPO_ARCHIVO` | `"dte"` (hidden input). |
+
+The response is `text/html; charset=iso-8859-1` titled `RESPALDO DE ARCHIVOS MIPYME` and reports the
+total matching documents in two places (observed 2026-10-25, both when `N > 0` and when `N = 0`):
+
+```html
+<div id="num_docs">
+  <strong>
+    N&uacute;mero total de documentos <span id="origen_doc"></span>: 41<span id="msg_too_much"></span>
+  </strong>
+</div>
+<div id="cant_reg" value="41"></div>
+```
+
+When `cant_reg` is `0`, the table body renders `<td class="KnockoutDataTD" colspan="13">No hay
+resultados con el filtro aplicado.</td>` and hides `#btn_respaldar`.
+
+### 8.2 Per-download cap (20 documents) and bisection
+
+When `cant_reg > 20`, the page's `window.onload` hides `#btn_respaldar` and appends
+`. El numero maximo de documentos para respaldar es 20. Reduzca la cantidad usando el filtro.` to
+`#msg_too_much`. Calling `download.cgi` for a range with 21+ documents returns an HTML error page
+with HTTP `200`, never a truncated XML.
+
+To download a range with more than 20 documents without dropping any:
+1. Query `lista_documentos.cgi` for `[desde, hasta]`.
+2. If `total === 0`, skip; if `total <= 20`, download the tramo directly.
+3. If `total > 20` and `desde < hasta`, bisect the date range at the midpoint day (`desde..medio`
+   and `medio+1..hasta`) and recurse.
+4. If a single day (`desde === hasta`) still exceeds 20 documents, partition that day by `TPO_DOC`
+   (`33`, `34`, `46`, `56`, `61`, `52`, `110`, `111`, `112`). If a single `(day, TPO_DOC)` still
+   exceeds 20 (or the sum across known types is less than the day's total), refuse with a clear
+   error rather than returning a partial bundle.
+
+### 8.3 XML download — `download.cgi`
+
+Triggered in the page by `new_win_down('XML')` → `llamaDownload()`:
+
+```
+GET /cgi-bin/Portal001/download.cgi
+      ?RUT_EMP=<body>&DV_EMP=<dv>&ORIGEN=<ENV|RCP>&RUT_RECP=&FOLIO=&FOLIOHASTA=
+      &RZN_SOC=&FEC_DESDE=<YYYY-MM-DD>&FEC_HASTA=<YYYY-MM-DD>&TPO_DOC=&ESTADO=&ORDEN=&DOWNLOAD=XML
+Referer: https://www1.sii.cl/cgi-bin/Portal001/lista_documentos.cgi
+```
+
+- **Payload and encoding:** raw bytes (`requestBinary`) starting with
+  `<?xml version="1.0" encoding="ISO-8859-1"?>` followed by `<SetDTE>` (or `<EnvioDTE>`), containing
+  each `<DTE version="1.0">` with its full `<Documento>` (`Encabezado`, `Detalle` lines,
+  `Referencia`, `<TED>` timbre and `<Signature>`). Because the XML carries a cryptographic
+  `xmldsig` signature over ISO-8859-1 bytes, it must be written to disk **undecoded** via
+  `requestBinary` + `FileSink` (ADR-022): running it through a UTF-8 `TextDecoder` corrupts accented
+  bytes and invalidates the signature.
+- **Rejections and commented-out template alerts:** on an unselected empresa, unauthorized user or
+  invalid filter, SII answers HTTP `200` (`text/html`) with a `<script>` calling `alert('...')` and
+  `history.back()` / `history.go(-1)`. The valid listing template itself contains a commented-out
+  `//alert("Maximo numero de docmentos para respaldar: 20. Reduzca la cantidad usando el filtro.");`
+  and `//alert(urldata);` — any alert extractor must ignore `//`-commented lines.
+- **Captcha state (observed 2026-10-25):** the page includes `<script src="/Portal001/JS/captcha.js">`
+  and `<input type="hidden" name="recaptcha-response" id="recaptcha-response"/>`, guarded by
+  `if (typeof llamaRecaptchaConCallback == 'function')`. On the live portal `captcha.js` does not
+  activate a challenge and `recaptcha-response` is accepted empty.
+
+### 8.4 Observed coverage limit on received documents (`ORIGEN=RCP`)
+
+`ORIGEN=RCP` returns the XML of received DTEs that entered the MIPYME repository (such as facturas
+de compra/venta `33`, `34`, `46`, notas `56`/`61` received by the taxpayer). **Observed gap
+(2026-10-25):** Guías de Despacho (`TPO_DOC=52`) issued to the taxpayer by suppliers using
+third-party / market billing software (outside Portal MIPYME) do **not** appear in `ORIGEN=RCP`
+here, even when they appear in the RCV metadata (`rcv_list` with `codigoTipoDoc: "52"`) and in the
+SII's *Registro de Guías de Despacho*. Consumers reconciling received dispatch guides cannot rely on
+Respaldo MIPYME alone for third-party-issued DTE 52.
+
