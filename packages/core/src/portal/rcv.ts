@@ -87,6 +87,14 @@ export interface RcvDetalleDoc {
   readonly montoNeto: number | null;
   readonly montoIva: number | null;
   readonly montoTotal: number | null;
+  /** Aggregate additional-tax amount (wire field totalDtoiMontoImp). */
+  readonly montoImpuestoAdicional: number | null;
+  /** IVA withheld by the document, distinct from an additional tax. */
+  readonly ivaRetenidoTotal: number | null;
+  readonly ivaRetenidoParcial: number | null;
+  readonly ivaNoRetenido: number | null;
+  readonly montoNoFacturable: number | null;
+  readonly tipoTransaccion: string | null;
   readonly eventoReceptor: string | null;
   readonly eventoReceptorLeyenda: string | null;
   readonly raw: Record<string, unknown>;
@@ -146,6 +154,16 @@ const DETALLE_ALIASES = {
   montoNeto: ['detMntNeto', 'mntNeto', 'montoNeto'],
   montoIva: ['detMntIVA', 'mntIVA', 'montoIVA'],
   montoTotal: ['detMntTotal', 'mntTotal', 'montoTotal'],
+  montoImpuestoAdicional: [
+    'totalDtoiMontoImp',
+    'montoTotalImpuestoAdicional',
+    'totalImpuestoAdicional',
+  ],
+  ivaRetenidoTotal: ['detIVARetTotal', 'ivaRetTotal'],
+  ivaRetenidoParcial: ['detIVARetParcial', 'ivaRetParcial'],
+  ivaNoRetenido: ['detIVANoRetenido', 'ivaNoRetenido'],
+  montoNoFacturable: ['detMntNoFact', 'mntNoFact', 'montoNoFacturable'],
+  tipoTransaccion: ['descTipoTransaccion', 'detTipoTransaccion', 'tipoTransaccion'],
   eventoReceptor: ['detEventoReceptor', 'eventoReceptor'],
   eventoReceptorLeyenda: ['detEventoReceptorLeyenda', 'eventoReceptorLeyenda'],
 } as const;
@@ -315,6 +333,12 @@ export async function fetchRcvDetalle(
     montoNeto: asInt(aliasGet(r, DETALLE_ALIASES.montoNeto)),
     montoIva: asInt(aliasGet(r, DETALLE_ALIASES.montoIva)),
     montoTotal: asInt(aliasGet(r, DETALLE_ALIASES.montoTotal)),
+    montoImpuestoAdicional: asInt(aliasGet(r, DETALLE_ALIASES.montoImpuestoAdicional)),
+    ivaRetenidoTotal: asInt(aliasGet(r, DETALLE_ALIASES.ivaRetenidoTotal)),
+    ivaRetenidoParcial: asInt(aliasGet(r, DETALLE_ALIASES.ivaRetenidoParcial)),
+    ivaNoRetenido: asInt(aliasGet(r, DETALLE_ALIASES.ivaNoRetenido)),
+    montoNoFacturable: asInt(aliasGet(r, DETALLE_ALIASES.montoNoFacturable)),
+    tipoTransaccion: asStr(aliasGet(r, DETALLE_ALIASES.tipoTransaccion)),
     eventoReceptor: asStr(aliasGet(r, DETALLE_ALIASES.eventoReceptor)),
     eventoReceptorLeyenda: asStr(aliasGet(r, DETALLE_ALIASES.eventoReceptorLeyenda)),
     raw: r,
