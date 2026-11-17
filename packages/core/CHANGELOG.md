@@ -4,6 +4,15 @@ All notable changes to `@albertomarturelo/sii-core` are documented here. The for
 loosely based on [Keep a Changelog](https://keepachangelog.com/); the package is
 pre-1.0, so MINOR bumps may carry breaking changes (pin or use `~` downstream).
 
+## Unreleased
+
+### Added
+
+- **`rcvBoletasVentaCsv`** — descarga asíncrona del CSV.gz de boletas electrónicas de venta
+  (tipo UI 3941) vía `getCtrlAsync` + `obtenerArchivoBLOB`, con salida tipada
+  (`RcvBoletasCsvResult`, `RcvBoletaCsvRow`, `DocumentoRcvCsv`). CLI: `sii rcv boletas-csv`;
+  MCP: `rcv_boletas_csv`. Contrato: `docs/sii-contract/rcv-boletas-csv.md`.
+
 ## 0.20.0 — 2026-11-13
 
 ### Added

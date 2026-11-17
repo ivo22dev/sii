@@ -2,16 +2,19 @@
 // (ADR-003). Each domain module owns a `commands/<mod>.ts` exporting a
 // `register<Mod>(program, runtime)`; `program.ts` just calls it, so the shared
 // command tree stays append-only across parallel modules (RCV sets this pattern).
+import { join } from 'node:path';
 import type { Command } from 'commander';
 import {
   formatMoney as money,
   formatRut as fmtRut,
+  rcvBoletasVentaCsv,
   rcvList,
   rcvListAll,
   rcvSummary,
   type RcvSide,
   type Runtime,
 } from '@albertomarturelo/sii-core';
+import { documentosDir } from '@albertomarturelo/sii-core/node';
 import { emit, out } from '../io.js';
 
 const sideOf = (opts: { venta?: boolean }): RcvSide => (opts.venta ? 'VENTA' : 'COMPRA');
@@ -106,4 +109,58 @@ export function registerRcv(program: Command, runtime: Runtime): void {
         }
       });
     });
+
+  rcv
+    .command('boletas-csv')
+    .description(
+      'Descarga el CSV.gz de boletas electrónicas de VENTA (RCV tipo UI 3941). ' +
+        'Cuando getDetalleVenta no entrega filas, esta es la vía oficial del portal.',
+    )
+    .argument('<periodo>', 'Período tributario (YYYYMM o YYYY-MM).')
+    .option('--rut <rut>', 'Operar como una empresa representada (del conjunto operable).')
+    .option('--directorio <path>', 'Carpeta destino (default: documentos/rcv bajo $SII_HOME).')
+    .option('--sin-solicitar', 'No pedir generación; solo consultar/descargar un job existente.')
+    .option('--sin-parsear', 'No parsear filas del CSV (solo descriptor de archivo).')
+    .option(
+      '--timeout <segundos>',
+      'Tiempo máximo de espera al job asíncrono (default 600).',
+      (v) => Number(v),
+      600,
+    )
+    .action(
+      async (
+        periodo: string,
+        opts: {
+          rut?: string;
+          directorio?: string;
+          sinSolicitar?: boolean;
+          sinParsear?: boolean;
+          timeout: number;
+        },
+      ) => {
+        const res = await rcvBoletasVentaCsv(runtime, {
+          periodo,
+          directorio: opts.directorio ?? join(documentosDir(), 'rcv'),
+          ...(opts.rut ? { rut: opts.rut } : {}),
+          solicitar: !opts.sinSolicitar,
+          parsear: !opts.sinParsear,
+          timeoutMs: opts.timeout * 1000,
+        });
+        emit(res, () => {
+          out(`RCV VENTA boletas ${res.periodo} — ${fmtRut(res.rut)}`);
+          out(`Archivo: ${res.archivo.path} (${res.archivo.bytes} bytes)`);
+          if (res.avisoSii) out(`Aviso SII: ${res.avisoSii}`);
+          if (res.totalFilas > 0) {
+            for (const d of res.filas.slice(0, 20)) {
+              out(
+                `  folio=${d.folio ?? '—'}  ${d.rutReceptor ?? '—'}  ${d.fechaEmision ?? '—'}  total=${money(d.montoTotal)}`,
+              );
+            }
+            if (res.filas.length > 20) out(`  … y ${res.filas.length - 20} más (ver JSON).`);
+          } else if (!opts.sinParsear) {
+            out('Sin filas parseadas en el CSV.');
+          }
+        });
+      },
+    );
 }

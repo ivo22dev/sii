@@ -1,15 +1,18 @@
 // `rcv_*` MCP tools — Registro de Compras y Ventas. Thin calls into @albertomarturelo/sii-core tasks
 // (ADR-003), read-only. Body-RUT (ADR-005): `rut` selects a represented empresa.
 // zod input schemas (ADR-011) — the SDK derives the protocol JSON Schema.
+import { join } from 'node:path';
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
 import {
+  rcvBoletasVentaCsv,
   rcvList,
   rcvListAll,
   rcvSummary,
   type RcvSide,
   type Runtime,
 } from '@albertomarturelo/sii-core';
+import { documentosDir } from '@albertomarturelo/sii-core/node';
 import { toolText } from '../tool-helpers.js';
 
 const sideOf = (venta?: boolean): RcvSide => (venta ? 'VENTA' : 'COMPRA');
@@ -88,6 +91,42 @@ export function registerRcvTools(server: McpServer, runtime: Runtime): void {
       toolText(async () =>
         JSON.stringify(
           await rcvListAll(runtime, { periodo, side: sideOf(venta), ...rutOpt(rut) }),
+          null,
+          2,
+        ),
+      ),
+  );
+
+  server.registerTool(
+    'rcv_boletas_csv',
+    {
+      title: 'RCV boletas venta (CSV gzip)',
+      description:
+        'Descarga el detalle de boletas electrónicas de VENTA como CSV comprimido (.csv.gz), ' +
+        'vía el job asíncrono del portal (tipo UI 3941). Devuelve descriptor de archivo, filas ' +
+        'tipadas parseadas y avisos de SII. Body-RUT: usa rut para una empresa representada. ' +
+        'Usa parsear=false para omitir filas (menos PII en el transcript).',
+      inputSchema: {
+        periodo: z.string(),
+        rut: z.string().optional(),
+        directorio: z.string().optional(),
+        solicitar: z.boolean().optional(),
+        parsear: z.boolean().optional(),
+        timeoutSegundos: z.number().int().positive().optional(),
+      },
+      annotations: { readOnlyHint: true },
+    },
+    ({ periodo, rut, directorio, solicitar, parsear, timeoutSegundos }) =>
+      toolText(async () =>
+        JSON.stringify(
+          await rcvBoletasVentaCsv(runtime, {
+            periodo,
+            directorio: directorio ?? join(documentosDir(), 'rcv'),
+            ...(rut ? { rut } : {}),
+            ...(solicitar !== undefined ? { solicitar } : {}),
+            ...(parsear !== undefined ? { parsear } : {}),
+            ...(timeoutSegundos !== undefined ? { timeoutMs: timeoutSegundos * 1000 } : {}),
+          }),
           null,
           2,
         ),

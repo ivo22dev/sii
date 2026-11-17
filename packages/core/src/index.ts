@@ -23,6 +23,7 @@ export type { OperateResult, OperableList } from './tasks/operate.js';
 export { describeOperating, formatOperableEntry } from './identity/index.js';
 export type { OperatingContext, OperableEntry } from './identity/index.js';
 export { rcvSummary, rcvList, rcvListAll } from './tasks/rcv.js';
+export { rcvBoletasVentaCsv } from './tasks/rcv-boletas-csv.js';
 export type {
   RcvResumen,
   RcvResumenRow,
@@ -32,6 +33,13 @@ export type {
   RcvDetalleAllDoc,
   RcvSide,
 } from './tasks/rcv.js';
+export type {
+  RcvBoletasCsvResult,
+  RcvBoletasCsvArgs,
+  DocumentoRcvCsv,
+  RcvBoletaCsvRow,
+  RcvAsyncJobRow,
+} from './tasks/rcv-boletas-csv.js';
 export {
   f22Status,
   f22Overview,
